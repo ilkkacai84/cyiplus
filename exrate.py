@@ -10,10 +10,10 @@ import urllib.parse
 import urllib.error
 from datetime import date, datetime
 import json
-import os
 import re
 import sys
 import time
+from pathlib import Path
 
 # ── 配置 ────────────────────────────────────────────
 SMBS_URL = "http://www.smbs.biz/Flash/TodayExRate_flash.jsp?tr_date={date}"
@@ -23,8 +23,13 @@ CURRENCY_MAP = {"CNH": "CNY"}
 
 MAX_RETRIES = 5
 RETRY_DELAY = 60
-LOG_DIR = "logs"
-CONFIG_FILE = "config.json"
+BASE_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+LOG_DIR = BASE_DIR / "logs"
+CONFIG_FILE = BASE_DIR / "config.json"
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 
@@ -34,9 +39,9 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 
 def log_failure(url, attempts, last_err, source_name=""):
     """将失败信息写入日志文件"""
-    os.makedirs(LOG_DIR, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     tag = date.today().strftime("%Y%m%d")
-    log_file = os.path.join(LOG_DIR, f"exrate_error_{tag}.log")
+    log_file = LOG_DIR / f"exrate_error_{tag}.log"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(
@@ -65,17 +70,19 @@ def fetch_with_retry(url, source_name="", decode="utf-8", is_json=False,
             text = body.decode(decode)
             obj = json.loads(text) if is_json else text
 
-            if not check_ok(obj):
-                last_err = "返回内容异常，未通过有效性检查"
-                print(f"[{source_name}][第{attempt}次] {last_err}，{RETRY_DELAY}秒后重试...",
-                      file=sys.stderr)
-            else:
+            if check_ok(obj):
                 return obj
+            last_err = "返回内容异常，未通过有效性检查"
 
-        except Exception as e:
+        except (urllib.error.URLError, TimeoutError, UnicodeError,
+                json.JSONDecodeError) as e:
             last_err = str(e)
-            print(f"[{source_name}][第{attempt}次] 请求失败: {last_err}，{RETRY_DELAY}秒后重试...",
-                  file=sys.stderr)
+
+        retry_message = (
+            f"，{RETRY_DELAY}秒后重试..." if attempt < MAX_RETRIES else ""
+        )
+        print(f"[{source_name}][第{attempt}次] 请求失败: "
+              f"{last_err}{retry_message}", file=sys.stderr)
 
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_DELAY)
@@ -103,29 +110,18 @@ def parse_smbs(raw):
         text = text[1:]
     params = urllib.parse.parse_qs(text)
 
-    currencies, seen = [], set()
-    for key, vals in params.items():
-        if re.match(r"^[A-Z]{3}$", key) and key not in seen:
-            seen.add(key)
-            currencies.append((key, vals[0]))
-
-    updown_map, diff_map = {}, {}
-    for key, vals in params.items():
-        m = re.match(r"^updown(\d+)$", key)
-        if m:
-            updown_map[int(m.group(1))] = int(vals[0])
-        m = re.match(r"^diff(\d+)$", key)
-        if m:
-            diff_map[int(m.group(1))] = vals[0]
-
     results = []
-    for i, (code, rate_str) in enumerate(currencies, start=1):
-        rate = float(rate_str.replace(",", ""))
-        display = CURRENCY_MAP.get(code, code)
+    for key, vals in params.items():
+        if not re.fullmatch(r"[A-Z]{3}", key):
+            continue
+        try:
+            rate = round(float(vals[0].replace(",", "")), 8)
+        except (IndexError, ValueError):
+            continue
         results.append({
-            "from_currency": display,
+            "from_currency": CURRENCY_MAP.get(key, key),
             "to_currency": "KRW",
-            "rate": f"{rate:.8f}".rstrip('0').rstrip('.'),
+            "rate": rate,
         })
     return results
 
@@ -159,7 +155,12 @@ def fetch_chinamoney(date_obj=None):
 
     data = fetch_with_retry(
         url, "chinamoney", is_json=True,
-        check_ok=lambda d: isinstance(d, dict) and "records" in d
+        check_ok=lambda d: (
+            isinstance(d, dict)
+            and isinstance(d.get("records"), list)
+            and isinstance(d.get("data"), dict)
+            and isinstance(d["data"].get("head"), list)
+        ),
     )
     if data is None:
         return None
@@ -172,78 +173,100 @@ def fetch_chinamoney(date_obj=None):
     # 找到指定日期的记录
     if date_obj is not None:
         ds = date_obj.strftime("%Y-%m-%d")
-        match = [r for r in records if r["date"] == ds]
-        if not match:
+        record = next(
+            (r for r in records if isinstance(r, dict) and r.get("date") == ds),
+            None,
+        )
+        if record is None:
             print(f"[提示] chinamoney 无 {ds} 的数据（可能非交易日），跳过", file=sys.stderr)
             return None
-        record = match[0]
     else:
         record = records[0]
+        if not isinstance(record, dict):
+            return None
 
     head = data["data"]["head"]
-    values = record["values"]
+    values = record.get("values", [])
 
     results = []
     for pair, val_str in zip(head, values):
         frm, to, mult = parse_chinamoney_pair(pair)
         if frm is None:
             continue
-        rate = float(val_str) / mult
-        # 统一格式：始终让 from_currency 为外币, to_currency 为 CNY
-        if to != "CNY":
-            # 例如 CNY/MOP → 翻转成 MOP/CNY, rate 取倒数
+        try:
+            rate = float(val_str) / mult
+        except (TypeError, ValueError):
+            continue
+        if frm == "CNY" and to != "CNY":
+            if rate == 0:
+                continue
             rate = 1.0 / rate
             frm, to = to, frm
+        elif to != "CNY":
+            continue
         results.append({
             "from_currency": frm,
             "to_currency": to,
-            "rate": f"{rate:.8f}".rstrip('0').rstrip('.'),
+            "rate": round(rate, 8),
         })
-    return {"date": record["date"], "rates": results}
+    if not results:
+        print("[提示] chinamoney 响应中没有可用汇率，跳过", file=sys.stderr)
+        return None
+    return {"date": record.get("date", ""), "rates": results}
 
 
 # ── 推送到外部 API ──────────────────────────────────
 
 
 def load_config():
-    """读取 config.json，失败返回 None"""
-    if not os.path.exists(CONFIG_FILE):
-        print(f"[错误] 配置文件 {CONFIG_FILE} 不存在", file=sys.stderr)
-        return None
+    """读取 config.json；文件不存在时返回空配置。"""
+    if not CONFIG_FILE.exists():
+        return {}
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
+        with CONFIG_FILE.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
         print(f"[错误] 读取配置文件失败: {e}", file=sys.stderr)
         return None
+    if not isinstance(config, dict):
+        print("[错误] config.json 顶层必须是 JSON 对象", file=sys.stderr)
+        return None
+    return config
 
 
-def push_via_uri(data, config):
-    """
-    将 data (dict) 以 JSON 格式 POST 到配置的 API URL。
-    请求体为 JSON，Content-Type: application/json。
-    """
+def push_json(data, config):
+    """将数据以 JSON POST 到配置的 API URL。"""
     api_cfg = config.get("push_api", {})
+    if not isinstance(api_cfg, dict):
+        print("[错误] push_api 必须是 JSON 对象", file=sys.stderr)
+        return False
     url = api_cfg.get("url", "").strip()
     if not url:
         print("[错误] 配置文件中 push_api.url 未设置", file=sys.stderr)
         return False
 
+    method = str(api_cfg.get("method", "POST")).upper()
+    if method != "POST":
+        print(f"[错误] 仅支持 POST 推送，当前配置为 {method}", file=sys.stderr)
+        return False
+
     timeout = api_cfg.get("timeout", 15)
-    headers = api_cfg.get("headers", {}) or {}
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        print("[错误] push_api.timeout 必须是正数", file=sys.stderr)
+        return False
+
+    headers = dict(api_cfg.get("headers", {}) or {})
     headers.setdefault("Content-Type", "application/json")
 
-    # JSON 编码为 bytes
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
 
     print(f"[推送] POST {url}")
     print(f"[推送] 数据大小: {len(body)} 字节")
 
-    # POST 请求
     try:
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp_body = resp.read().decode("utf-8")
+            resp_body = resp.read().decode("utf-8", errors="replace")
         print(f"[推送成功] HTTP {resp.status}")
         if resp_body.strip():
             print(f"  响应: {resp_body[:200]}")
@@ -258,10 +281,9 @@ def push_via_uri(data, config):
         print(f"[推送失败] {e}")
         last_err = str(e)
 
-    # 写失败日志
-    os.makedirs(LOG_DIR, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     tag = date.today().strftime("%Y%m%d")
-    log_file = os.path.join(LOG_DIR, f"push_error_{tag}.log")
+    log_file = LOG_DIR / f"push_error_{tag}.log"
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(
             f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] 推送失败\n'
@@ -276,42 +298,43 @@ def push_via_uri(data, config):
 # ── 格式化输出 ──────────────────────────────────────
 
 
-def table_for(rates, title="", show_change=True):
+def table_for(rates, title=""):
     """为汇率列表生成格式化表格"""
-    labels = {0: "→ 持平", 1: "↓ 下跌", 3: "↑ 上涨"}
     sep = "-" * 55
-    lines = [sep, f"  {title}", sep]
-    if show_change:
-        header = f"{'源币':>5} → {'目标':>5}   {'汇率':>12}   {'涨跌':>9}  {'状态'}"
-    else:
-        header = f"{'源币':>5} → {'目标':>5}   {'汇率':>12}"
-    lines.append(header)
-    lines.append(sep)
+    header = f"{'源币':>5} → {'目标':>5}   {'汇率':>12}"
+    lines = [sep, f"  {title}", sep, header, sep]
     for r in rates:
-        chg = r.get("change")
-        d = r.get("direction")
         rate_str = f"{float(r['rate']):>12,.4f}"
-        if show_change and chg is not None and d is not None:
-            status = labels.get(d, "?")
-            lines.append(
-                f"{r['from_currency']:>5} → {r['to_currency']:>5}   "
-                f"{rate_str}   {chg:>+9.2f}  {status}"
-            )
-        else:
-            lines.append(
-                f"{r['from_currency']:>5} → {r['to_currency']:>5}   "
-                f"{rate_str}"
-            )
+        lines.append(
+            f"{r['from_currency']:>5} → {r['to_currency']:>5}   {rate_str}"
+        )
     lines.append(sep)
     return "\n".join(lines)
+
+
 def build_payload(smbs_rates, cm_data, query_date):
     """组装完整的推送 / JSON 输出数据"""
     payload = {
+        "date": query_date.isoformat(),
         "smbs": smbs_rates,
     }
     if cm_data:
         payload["chinamoney"] = cm_data["rates"]
     return payload
+
+
+def resolve_query_date(cli_date, config):
+    """按命令行、配置文件、当天的优先级确定查询日期。"""
+    value = cli_date or config.get("date")
+    if not value:
+        return date.today()
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except ValueError as e:
+        source = "--date" if cli_date else "config.json 中的 date"
+        raise ValueError(
+            f"{source} 格式错误，请使用 YYYY-MM-DD: {value}"
+        ) from e
 
 
 # ── 主入口 ──────────────────────────────────────────
@@ -322,79 +345,61 @@ def main():
     parser = argparse.ArgumentParser(description="汇率查询与推送")
     parser.add_argument("--date", "-d", type=str, default=None,
                         help="日期，格式 YYYY-MM-DD（优先于 config.json）")
-    parser.add_argument("--json", action="store_true",
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true",
                         help="以 JSON 格式输出")
-    parser.add_argument("--push", action="store_true",
+    output.add_argument("--push", action="store_true",
                         help="获取数据后推送到 config.json 配置的 API")
     args = parser.parse_args()
 
-    # 解析日期：CLI --date > 配置文件 date > 今天
-    query_date = date.today()
-    cfg_date = None
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                cfg_date = cfg.get("date", "") or None
-        except Exception:
-            pass  # 配置文件读取失败不阻塞
+    config = load_config()
+    if config is None:
+        sys.exit(1)
+    try:
+        query_date = resolve_query_date(args.date, config)
+    except ValueError as e:
+        print(f"[错误] {e}", file=sys.stderr)
+        sys.exit(1)
 
-    if args.date:
-        try:
-            query_date = datetime.strptime(args.date, "%Y-%m-%d").date()
-        except ValueError:
-            print(f"[错误] 日期格式错误，请使用 YYYY-MM-DD: {args.date}",
-                  file=sys.stderr)
-            sys.exit(1)
-    elif cfg_date:
-        try:
-            query_date = datetime.strptime(str(cfg_date), "%Y-%m-%d").date()
-        except ValueError:
-            print(f"[错误] config.json 中 date 格式错误: {cfg_date}，使用今天",
-                  file=sys.stderr)
-
-    # 获取数据（两个 API 必须都成功）
     raw_smbs = fetch_smbs(query_date)
-    cm = fetch_chinamoney(query_date)
-
     if raw_smbs is None:
         print("[错误] smbs (韩元牌价) 获取失败，退出", file=sys.stderr)
         sys.exit(1)
+
+    smbs = parse_smbs(raw_smbs)
+    if not smbs:
+        print("[错误] smbs 响应中没有可用汇率，取消输出和推送",
+              file=sys.stderr)
+        sys.exit(1)
+
+    cm = fetch_chinamoney(query_date)
     if cm is None:
         print("[提示] chinamoney (人民币中间价) 获取失败，跳过", file=sys.stderr)
 
-    smbs = parse_smbs(raw_smbs)
     payload = build_payload(smbs, cm, query_date)
 
     if args.push:
-        # 推送模式
-        cfg = load_config()
-        if cfg is None:
+        if not config:
+            print(f"[错误] 推送模式需要配置文件: {CONFIG_FILE}", file=sys.stderr)
             sys.exit(1)
-        ok = push_via_uri(payload, cfg)
+        ok = push_json(payload, config)
         sys.exit(0 if ok else 1)
 
     elif args.json:
-        # JSON 输出
         print(json.dumps(payload, ensure_ascii=False, indent=2))
 
     else:
-        # 表格输出
         ds = query_date.strftime("%Y-%m-%d")
         print(f"\n  汇率  {ds}\n")
-        print(table_for(smbs, "韩元牌价 (smbs.biz) — 1外币 = ?韩元", show_change=False))
+        print(table_for(smbs, "韩元牌价 (smbs.biz) — 1外币 = ?韩元"))
         print(f"  共 {len(smbs)} 种货币\n")
 
         if cm:
-            print(table_for(cm["rates"], "人民币中间价 (chinamoney)", show_change=False))
+            print(table_for(cm["rates"], "人民币中间价 (chinamoney)"))
             print(f"  共 {len(cm['rates'])} 个货币对，交易日 {cm['date']}")
         else:
             print("  (chinamoney 数据不可用)")
         print(f"  数据来源: smbs.biz / chinamoney.com.cn")
-        print(f"\n  --- smbs 原始报文 (截取) ---")
-        print(f"  {raw_smbs[:150].strip()}")
-        print(f"  ...")
-        print(f"  {raw_smbs[-150:].strip()}")
 
 
 if __name__ == "__main__":

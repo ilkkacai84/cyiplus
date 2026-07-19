@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 
 logs/
+config.json
+*.zip
 
 build/
 dist/
